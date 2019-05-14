@@ -19,6 +19,7 @@ local singletons   = require "kong.singletons"
 local certificate  = require "kong.runloop.certificate"
 local concurrency  = require "kong.concurrency"
 local ngx_re       = require "ngx.re"
+local semaphore    = require "ngx.semaphore"
 local PluginsIterator = require "kong.runloop.plugins_iterator"
 
 
@@ -39,6 +40,7 @@ local exit         = ngx.exit
 local header       = ngx.header
 local ngx_now      = ngx.now
 local timer_at     = ngx.timer.at
+local timer_every  = ngx.timer.every
 local re_match     = ngx.re.match
 local re_find      = ngx.re.find
 local re_split     = ngx_re.split
@@ -51,6 +53,7 @@ local unpack       = unpack
 
 
 local ERR          = ngx.ERR
+local NOTICE       = ngx.NOTICE
 local INFO         = ngx.INFO
 local WARN         = ngx.WARN
 local CRIT         = ngx.CRIT
@@ -65,10 +68,11 @@ local TTL_ZERO = { ttl = 0 }
 
 
 local get_plugins_iterator, build_plugins_iterator, update_plugins_iterator
+local rebuild_plugins_iterator, plugins_iterator_semaphore
 
 local get_router, build_router, update_router
 local server_header = meta._SERVER_TOKENS
-
+local rebuild_router, router_semaphore
 local build_router_timeout
 
 
@@ -351,6 +355,112 @@ local function register_events()
   end)
 end
 
+local rebuild
+do
+  local function acquire_semaphore(semaphore, wait)
+    local ok, err = semaphore:wait(wait or 0)
+    if not ok then
+      if err ~= "timeout" then
+        log(ERR, "error attempting to acquire semaphore: " .. err)
+      elseif wait and wait > 0 then
+        log(NOTICE, "timeout attempting to acquire semaphore")
+      end
+
+      return false
+    end
+
+    return true
+  end
+
+
+  local function release_semaphore(semaphore)
+    semaphore:post()
+  end
+
+
+  local function get_version(name)
+    if not kong.cache then
+      return "init"
+    end
+
+    local version, err = kong.cache:get(name .. ":version", TTL_ZERO, utils.uuid)
+    if err then
+      log(CRIT, "could not ensure ", name," is up to date: ", err)
+      return nil
+    end
+
+    return version
+  end
+
+
+  local function safe_rebuild(callback, version)
+    local pok, ok, err = pcall(callback, version)
+    if not pok or not ok then
+      log(CRIT, "could not rebuild synchronously: ", ok or err)
+    end
+  end
+
+
+  local function rebuild_timer(premature, callback, version, semaphore)
+    if premature then
+      release_semaphore(semaphore)
+      return
+    end
+    safe_rebuild(callback, version)
+    release_semaphore(semaphore)
+  end
+
+
+  local function rebuild_async(callback, version, semaphore)
+    local ok, err = timer_at(0, rebuild_timer, callback, version, semaphore)
+    if not ok then
+      log(CRIT, "could not create rebuild timer: ", err)
+      return false
+    end
+
+    return true
+  end
+
+
+  rebuild = function(name, callback, version, semaphore, wait)
+    local current_version = get_version(name)
+    if current_version == version then
+      return
+    end
+
+    local ok = acquire_semaphore(semaphore, wait)
+    if not ok then
+      if wait and wait > 0 then
+        safe_rebuild(callback, current_version)
+      end
+
+      return
+    end
+
+    current_version = get_version(name)
+    if current_version == version then
+      release_semaphore(semaphore)
+      return
+    end
+
+    if wait and wait > 0 then
+      safe_rebuild(callback, current_version)
+      release_semaphore(semaphore)
+
+    else
+      ok = rebuild_async(callback, current_version, semaphore)
+      if not ok then
+        if wait and wait == 0 then
+          safe_rebuild(callback, current_version)
+        end
+
+        release_semaphore(semaphore)
+      end
+    end
+  end
+end
+
+
 
 do
   local plugins_iterator
@@ -415,6 +525,12 @@ do
 
   get_plugins_iterator = function()
     return plugins_iterator
+  end
+
+
+  rebuild_plugins_iterator = function(wait)
+    local version = plugins_iterator and plugins_iterator.version
+    rebuild("plugins", update_plugins_iterator, version, plugins_iterator_semaphore, wait)
   end
 end
 
@@ -647,6 +763,11 @@ do
   get_router = function()
     return router
   end
+
+
+  rebuild_router = function(wait)
+    rebuild("router", update_router, router_version, router_semaphore, wait)
+  end
 end
 
 
@@ -742,6 +863,17 @@ return {
       reports.init_worker()
       update_lua_mem(true)
 
+      local err
+      plugins_iterator_semaphore, err = semaphore.new(1)
+      if err then
+        log(CRIT, "failed to create plugins iterator semaphore: ", err)
+      end
+
+      router_semaphore, err = semaphore.new(1)
+      if err then
+        log(CRIT, "failed to create router semaphore: ", err)
+      end
+
       register_events()
 
       -- initialize balancers for active healthchecks
@@ -749,6 +881,10 @@ return {
         balancer.init()
       end)
 
+      timer_every(1, function(premature)
+        rebuild_router()
+        rebuild_plugins_iterator()
+      end)
 
       do
         build_router_timeout = 60
