@@ -510,7 +510,8 @@ do
     return service
   end
 
-  build_router = function(db, version)
+  build_router = function(version)
+    local db = kong.db
     local routes, i = {}, 0
 
     local err
@@ -608,7 +609,7 @@ do
     -- router needs to be rebuilt in this worker
     log(DEBUG, "rebuilding router")
 
-    local ok, err = build_router(singletons.db, version)
+    local ok, err = build_router(version)
     if not ok then
       log(CRIT, "could not rebuild router: ", err)
       return nil, err
