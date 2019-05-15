@@ -43,7 +43,7 @@ local CorrelationIdHandler = {}
 
 
 CorrelationIdHandler.PRIORITY = 1
-CorrelationIdHandler.VERSION = "1.0.0"
+CorrelationIdHandler.VERSION = "1.1.0"
 
 
 function CorrelationIdHandler:init_worker()

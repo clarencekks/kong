@@ -27,7 +27,7 @@ end
 
 
 ResponseRateLimitingHandler.PRIORITY = 900
-ResponseRateLimitingHandler.VERSION = "1.0.0"
+ResponseRateLimitingHandler.VERSION = "1.1.0"
 
 
 return ResponseRateLimitingHandler
